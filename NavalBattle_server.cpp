@@ -12,6 +12,11 @@
 #include <functional>
 #include <random>
 #include <limits>
+#include <queue>
+#include <map>
+#include <atomic>
+#include <chrono>
+#include <mutex>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -77,6 +82,10 @@ const int NUM_SHIPS = 10;
 const int BUFFER_SIZE = 256;
 const int MAX_PLAYER_NAME = 32;
 
+bool safeSend(SOCKET socket, const std::string& data);
+void safeCloseSocket(SOCKET& socket);
+bool safeRecv(SOCKET socket, std::string& data, int maxSize);
+
 // Состояния клетки на игровом поле
 enum CellState {
     EMPTY = 0,
@@ -106,10 +115,35 @@ public:
     bool ready;
     std::string name;
     bool connected;
+    int playerId;
+    sockaddr_in clientAddr;
 
-    Player(SOCKET sock) : socket(sock), ready(false), connected(true) {
+    Player(SOCKET sock, const sockaddr_in& addr, int id)
+        : socket(sock), ready(false), connected(true), playerId(id), clientAddr(addr) {
         board.resize(BOARD_SIZE, std::vector<CellState>(BOARD_SIZE, EMPTY));
         enemyView.resize(BOARD_SIZE, std::vector<CellState>(BOARD_SIZE, EMPTY));
+        name = "Player " + std::to_string(id);
+    }
+
+    ~Player() {
+        disconnect();
+    }
+
+    void disconnect() {
+        if (connected) {
+            connected = false;
+            safeCloseSocket(socket);
+        }
+    }
+
+    std::string getIPAddress() const {
+        char ipStr[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &clientAddr.sin_addr, ipStr, INET_ADDRSTRLEN);
+        return std::string(ipStr);
+    }
+
+    int getPort() const {
+        return ntohs(clientAddr.sin_port);
     }
 
     bool placeShip(int size, int x, int y, bool horizontal) {
@@ -268,50 +302,6 @@ public:
     }
 };
 
-// Безопасные функции для работы с сокетами
-bool safeSend(SOCKET socket, const std::string& data) {
-    if (socket == INVALID_SOCKET) return false;
-
-    const char* buffer = data.c_str();
-    int totalSent = 0;
-    int length = (int)data.length();
-
-    while (totalSent < length) {
-        int sent = send(socket, buffer + totalSent, length - totalSent, 0);
-        if (sent == SOCKET_ERROR) {
-            if (WSAGetLastError() == WSAEWOULDBLOCK) {
-                Sleep(10);
-                continue;
-            }
-            return false;
-        }
-        totalSent += sent;
-    }
-    return true;
-}
-
-bool safeRecv(SOCKET socket, std::string& data, int maxSize = BUFFER_SIZE) {
-    if (socket == INVALID_SOCKET) return false;
-
-    char buffer[BUFFER_SIZE];
-    int bytesReceived = recv(socket, buffer, maxSize - 1, 0);
-
-    if (bytesReceived == SOCKET_ERROR) {
-        return false;
-    }
-    else if (bytesReceived == 0) {
-        return false;
-    }
-
-    buffer[bytesReceived] = '\0';
-    data = std::string(buffer, bytesReceived);
-
-    data.erase(std::remove(data.begin(), data.end(), '\r'), data.end());
-    data.erase(std::remove(data.begin(), data.end(), '\n'), data.end());
-
-    return true;
-}
-
 // Класс игры
 class Game {
 public:
@@ -320,8 +310,16 @@ public:
     bool gameStarted;
     bool gameOver;
     Player* currentPlayer;
+    std::atomic<bool> active;
 
-    Game(Player* p1, Player* p2) : player1(p1), player2(p2), gameStarted(false), gameOver(false), currentPlayer(p1) {}
+    Game(Player* p1, Player* p2)
+        : player1(p1), player2(p2), gameStarted(false), gameOver(false),
+        currentPlayer(p1), active(true) {
+    }
+
+    ~Game() {
+        endGame("Game terminated");
+    }
 
     bool bothReady() {
         return player1->ready && player2->ready && player1->connected && player2->connected;
@@ -418,7 +416,67 @@ public:
         }
         return true;
     }
+
+    void endGame(const std::string& reason) {
+        if (!active) return;
+
+        active = false;
+        gameOver = true;
+
+        if (player1->connected) {
+            safeSend(player1->socket, "GAME_OVER: " + reason + "\n");
+        }
+        if (player2->connected) {
+            safeSend(player2->socket, "GAME_OVER: " + reason + "\n");
+        }
+    }
 };
+
+// Безопасные функции для работы с сокетами
+bool safeSend(SOCKET socket, const std::string& data) {
+    if (socket == INVALID_SOCKET) return false;
+
+    const char* buffer = data.c_str();
+    int totalSent = 0;
+    int length = (int)data.length();
+
+    while (totalSent < length) {
+        int sent = send(socket, buffer + totalSent, length - totalSent, 0);
+        if (sent == SOCKET_ERROR) {
+            int error = WSAGetLastError();
+            if (error == WSAEWOULDBLOCK) {
+                Sleep(10);
+                continue;
+            }
+            return false;
+        }
+        totalSent += sent;
+    }
+    return true;
+}
+
+bool safeRecv(SOCKET socket, std::string& data, int maxSize = BUFFER_SIZE) {
+    if (socket == INVALID_SOCKET) return false;
+
+    char buffer[BUFFER_SIZE];
+    int bytesReceived = recv(socket, buffer, maxSize - 1, 0);
+
+    if (bytesReceived == SOCKET_ERROR) {
+        int error = WSAGetLastError();
+        return false;
+    }
+    else if (bytesReceived == 0) {
+        return false;
+    }
+
+    buffer[bytesReceived] = '\0';
+    data = std::string(buffer, bytesReceived);
+
+    data.erase(std::remove(data.begin(), data.end(), '\r'), data.end());
+    data.erase(std::remove(data.begin(), data.end(), '\n'), data.end());
+
+    return true;
+}
 
 // Функция для безопасного закрытия сокета
 void safeCloseSocket(SOCKET& socket) {
@@ -429,226 +487,440 @@ void safeCloseSocket(SOCKET& socket) {
     }
 }
 
+// Класс для управления сервером
+class GameServer {
+private:
+    SOCKET serverSocket;
+    int port;
+    std::atomic<bool> running;
+    std::queue<Player*> waitingPlayers;
+    std::vector<Game*> activeGames;
+    std::vector<std::thread> gameThreads;
+    std::mutex queueMutex;
+    std::mutex gamesMutex;
+    int nextPlayerId;
+
+public:
+    GameServer(int serverPort) : port(serverPort), running(false), nextPlayerId(1) {
+        serverSocket = INVALID_SOCKET;
+    }
+
+    ~GameServer() {
+        stop();
+    }
+
+    bool initialize() {
+        WSADATA wsaData;
+        if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+            std::cerr << "WSAStartup failed\n";
+            return false;
+        }
+
+        serverSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (serverSocket == INVALID_SOCKET) {
+            std::cerr << "Error creating socket: " << WSAGetLastError() << "\n";
+            WSACleanup();
+            return false;
+        }
+
+        int yes = 1;
+        if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, (char*)&yes, sizeof(yes)) == SOCKET_ERROR) {
+            std::cerr << "Setsockopt failed: " << WSAGetLastError() << "\n";
+            safeCloseSocket(serverSocket);
+            WSACleanup();
+            return false;
+        }
+
+        sockaddr_in serverAddr{};
+        serverAddr.sin_family = AF_INET;
+        serverAddr.sin_addr.s_addr = INADDR_ANY;
+        serverAddr.sin_port = htons(port);
+
+        if (bind(serverSocket, (SOCKADDR*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
+            std::cerr << "Bind failed on port " << port << ": " << WSAGetLastError() << "\n";
+            safeCloseSocket(serverSocket);
+            WSACleanup();
+            return false;
+        }
+
+        if (listen(serverSocket, SOMAXCONN) == SOCKET_ERROR) {
+            std::cerr << "Listen failed: " << WSAGetLastError() << "\n";
+            safeCloseSocket(serverSocket);
+            WSACleanup();
+            return false;
+        }
+
+        std::cout << "Server initialized on port " << port << "\n";
+        return true;
+    }
+
+    void start() {
+        running = true;
+        std::cout << "Server started. Waiting for players...\n";
+
+        // Поток для приема новых подключений
+        std::thread acceptorThread(&GameServer::acceptConnections, this);
+
+        // Поток для управления играми
+        std::thread matchmakerThread(&GameServer::matchmakingLoop, this);
+
+        // Поток для очистки завершенных игр
+        std::thread cleanupThread(&GameServer::cleanupLoop, this);
+
+        // Основной поток для управления сервером
+        serverManagementLoop();
+
+        acceptorThread.join();
+        matchmakerThread.join();
+        cleanupThread.join();
+    }
+
+    void stop() {
+        running = false;
+
+        // Закрыть все активные игры
+        {
+            std::lock_guard<std::mutex> lock(gamesMutex);
+            for (auto game : activeGames) {
+                game->endGame("Server shutdown");
+                delete game;
+            }
+            activeGames.clear();
+        }
+
+        // Очистить очередь ожидания
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            while (!waitingPlayers.empty()) {
+                Player* player = waitingPlayers.front();
+                waitingPlayers.pop();
+                safeSend(player->socket, "Server is shutting down. Goodbye!\n");
+                delete player;
+            }
+        }
+
+        safeCloseSocket(serverSocket);
+        WSACleanup();
+
+        std::cout << "Server stopped.\n";
+    }
+
+private:
+    void acceptConnections() {
+        fd_set readSet;
+        timeval timeout;
+
+        while (running) {
+            FD_ZERO(&readSet);
+            FD_SET(serverSocket, &readSet);
+
+            timeout.tv_sec = 1;
+            timeout.tv_usec = 0;
+
+            int selectResult = select(0, &readSet, nullptr, nullptr, &timeout);
+
+            if (selectResult > 0 && FD_ISSET(serverSocket, &readSet)) {
+                sockaddr_in clientAddr;
+                int clientAddrSize = sizeof(clientAddr);
+                SOCKET clientSocket = accept(serverSocket, (SOCKADDR*)&clientAddr, &clientAddrSize);
+
+                if (clientSocket != INVALID_SOCKET) {
+                    // Устанавливаем таймаут на чтение
+                    DWORD timeoutMs = 30000;
+                    setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO,
+                        (char*)&timeoutMs, sizeof(timeoutMs));
+
+                    char clientIP[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &clientAddr.sin_addr, clientIP, INET_ADDRSTRLEN);
+
+                    std::cout << "New connection from " << clientIP << ":"
+                        << ntohs(clientAddr.sin_port) << std::endl;
+
+                    Player* newPlayer = new Player(clientSocket, clientAddr, nextPlayerId++);
+
+                    // Отправляем приветственное сообщение
+                    std::string welcomeMsg = "Welcome to Sea Battle Server!\n";
+                    welcomeMsg += "You are Player " + std::to_string(newPlayer->playerId) + "\n";
+                    welcomeMsg += "Waiting for opponent...\n";
+                    safeSend(clientSocket, welcomeMsg);
+
+                    // Добавляем игрока в очередь ожидания
+                    {
+                        std::lock_guard<std::mutex> lock(queueMutex);
+                        waitingPlayers.push(newPlayer);
+                    }
+                }
+            }
+            else if (selectResult == SOCKET_ERROR) {
+                if (running) {
+                    std::cerr << "Select error in accept thread: " << WSAGetLastError() << std::endl;
+                }
+                break;
+            }
+        }
+    }
+
+    void matchmakingLoop() {
+        while (running) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+            // Проверяем, есть ли как минимум 2 игрока в очереди
+            std::lock_guard<std::mutex> lock(queueMutex);
+            if (waitingPlayers.size() >= 2) {
+                Player* player1 = waitingPlayers.front();
+                waitingPlayers.pop();
+                Player* player2 = waitingPlayers.front();
+                waitingPlayers.pop();
+
+                // Проверяем, что оба игрока еще подключены
+                if (player1->connected && player2->connected) {
+                    // Создаем новую игру в отдельном потоке
+                    Game* newGame = new Game(player1, player2);
+                    {
+                        std::lock_guard<std::mutex> lock(gamesMutex);
+                        activeGames.push_back(newGame);
+                    }
+
+                    std::thread gameThread(&GameServer::runGame, this, newGame);
+                    gameThread.detach();
+
+                    std::cout << "Started new game between Player " << player1->playerId
+                        << " and Player " << player2->playerId << std::endl;
+                }
+                else {
+                    // Если кто-то отключился, удаляем обоих
+                    if (player1->connected) {
+                        safeSend(player1->socket, "Opponent disconnected during matchmaking\n");
+                        delete player1;
+                    }
+                    if (player2->connected) {
+                        safeSend(player2->socket, "Opponent disconnected during matchmaking\n");
+                        delete player2;
+                    }
+                }
+            }
+        }
+    }
+
+    void runGame(Game* game) {
+        auto setupPhase = [](Player& player) -> bool {
+            const std::string welcome = "Welcome to Sea Battle! Placing ships automatically...\n";
+            if (!safeSend(player.socket, welcome)) {
+                player.connected = false;
+                return false;
+            }
+
+            player.autoPlaceShips();
+
+            std::string boardMsg = "Your ships have been placed automatically:\n";
+            boardMsg += player.getBoardString() + "\n";
+            if (!safeSend(player.socket, boardMsg)) {
+                player.connected = false;
+                return false;
+            }
+
+            player.ready = true;
+            const std::string readyMsg = "All ships placed! Waiting for other player...\n";
+            if (!safeSend(player.socket, readyMsg)) {
+                player.connected = false;
+                return false;
+            }
+            return true;
+            };
+
+        // Фаза расстановки кораблей
+        std::thread setupThread1(setupPhase, std::ref(*game->player1));
+        std::thread setupThread2(setupPhase, std::ref(*game->player2));
+
+        setupThread1.join();
+        setupThread2.join();
+
+        if (!game->player1->connected || !game->player2->connected) {
+            game->endGame("Player disconnected during setup");
+            return;
+        }
+
+        // Ждем, пока оба игрока будут готовы
+        while (!game->bothReady() && game->active && running) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (!game->checkConnections()) {
+                game->endGame("Player disconnected while waiting for readiness");
+                return;
+            }
+        }
+
+        if (game->bothReady() && game->active && running) {
+            const std::string startMsg = "Game started! Player 1 goes first.\n";
+            if (!safeSend(game->player1->socket, startMsg) || !safeSend(game->player2->socket, startMsg)) {
+                game->endGame("Failed to send start message");
+                return;
+            }
+
+            game->gameStarted = true;
+        }
+        else {
+            return;
+        }
+
+        // Основной игровой цикл
+        std::string inputBuffer;
+        while (!game->gameOver && game->active && running && game->checkConnections()) {
+            Player* current = game->currentPlayer;
+            Player* opponent = game->getOpponent();
+
+            std::string currentTurnMsg = "YOUR_TURN\n";
+            currentTurnMsg += "Your board:\n" + current->getBoardString() + "\n";
+            currentTurnMsg += "Enemy view:\n" + current->getEnemyViewString() + "\n";
+            currentTurnMsg += "Enter coordinates to shoot (x y): ";
+
+            std::string otherTurnMsg = "OPPONENT_TURN\n";
+            otherTurnMsg += "Your board:\n" + opponent->getBoardString() + "\n";
+            otherTurnMsg += "Enemy view:\n" + opponent->getEnemyViewString() + "\n";
+            otherTurnMsg += "Waiting for opponent's move...\n";
+
+            if (!safeSend(current->socket, currentTurnMsg) || !safeSend(opponent->socket, otherTurnMsg)) {
+                game->endGame("Failed to send turn message");
+                break;
+            }
+
+            if (!safeRecv(current->socket, inputBuffer)) {
+                std::cout << "Player " << current->playerId << " disconnected during game\n";
+                current->connected = false;
+                game->endGame("Player disconnected");
+                break;
+            }
+
+            int x, y;
+            char extra;
+            if (sscanf_s(inputBuffer.c_str(), "%d %d %c", &x, &y, &extra, 1) == 2) {
+                if (x < 0 || x >= BOARD_SIZE || y < 0 || y >= BOARD_SIZE) {
+                    const std::string errorMsg = "Invalid coordinates. Use values between 0 and 9.\n";
+                    safeSend(current->socket, errorMsg);
+                    continue;
+                }
+
+                std::string result = game->processShot(x, y);
+
+                std::string resultMsg = current->name + " shot at (" + std::to_string(x) + "," + std::to_string(y) + ") - " + result;
+
+                if (!safeSend(current->socket, resultMsg) || !safeSend(opponent->socket, resultMsg)) {
+                    game->endGame("Failed to send result message");
+                    break;
+                }
+
+                if (!game->gameOver && result.find("HIT") == std::string::npos && result.find("Already attacked") == std::string::npos) {
+                    game->switchTurn();
+                }
+            }
+            else {
+                const std::string errorMsg = "Invalid input format. Use: x y (numbers 0-9)\n";
+                safeSend(current->socket, errorMsg);
+            }
+        }
+
+        if (game->gameOver && game->active) {
+            if (game->bothReady()) {
+                std::string winMsg = "Congratulations! You won the game!\n";
+                std::string loseMsg = "Game over! You lost.\n";
+
+                safeSend(game->currentPlayer->socket, winMsg);
+                safeSend(game->getOpponent()->socket, loseMsg);
+
+                std::cout << "Game finished. Winner: Player " << game->currentPlayer->playerId << std::endl;
+            }
+            else {
+                std::string disconnectMsg = "Game ended due to player disconnect.\n";
+                if (game->player1->connected) safeSend(game->player1->socket, disconnectMsg);
+                if (game->player2->connected) safeSend(game->player2->socket, disconnectMsg);
+
+                std::cout << "Game terminated due to player disconnect" << std::endl;
+            }
+        }
+
+        // Удаляем игроков
+        delete game->player1;
+        delete game->player2;
+
+        // Помечаем игру для удаления
+        game->active = false;
+    }
+
+    void cleanupLoop() {
+        while (running) {
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+
+            std::lock_guard<std::mutex> lock(gamesMutex);
+            auto it = activeGames.begin();
+            while (it != activeGames.end()) {
+                if (!(*it)->active) {
+                    delete* it;
+                    it = activeGames.erase(it);
+                }
+                else {
+                    ++it;
+                }
+            }
+        }
+    }
+
+    void serverManagementLoop() {
+        std::cout << "\nServer commands:\n";
+        std::cout << "  /stats - Show server statistics\n";
+        std::cout << "  /stop - Stop the server\n";
+        std::cout << "  /help - Show this help\n\n";
+
+        while (running) {
+            std::string command = InputUtils::getTrimmedInput("> ");
+
+            if (command == "/stats") {
+                showStats();
+            }
+            else if (command == "/stop") {
+                std::cout << "Stopping server...\n";
+                running = false;
+            }
+            else if (command == "/help") {
+                std::cout << "Available commands:\n";
+                std::cout << "  /stats - Show server statistics\n";
+                std::cout << "  /stop - Stop the server\n";
+                std::cout << "  /help - Show this help\n";
+            }
+            else if (!command.empty()) {
+                std::cout << "Unknown command. Type /help for available commands.\n";
+            }
+        }
+    }
+
+    void showStats() {
+        std::lock_guard<std::mutex> lock1(queueMutex);
+        std::lock_guard<std::mutex> lock2(gamesMutex);
+
+        std::cout << "\n=== Server Statistics ===\n";
+        std::cout << "Waiting players: " << waitingPlayers.size() << "\n";
+        std::cout << "Active games: " << activeGames.size() << "\n";
+        std::cout << "Total players served: " << (nextPlayerId - 1) << "\n";
+        std::cout << "=========================\n\n";
+    }
+};
+
 int main() {
     std::cout << "=== Sea Battle Server ===\n\n";
 
     // Получаем порт от пользователя
     int port = InputUtils::getServerPort();
 
-    std::cout << "\nStarting server on port " << port << "...\n";
+    std::cout << "\nInitializing server on port " << port << "...\n";
 
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        std::cerr << "WSAStartup failed\n";
+    GameServer server(port);
+
+    if (!server.initialize()) {
+        std::cerr << "Failed to initialize server\n";
+        std::cout << "Press Enter to exit...";
+        std::cin.ignore();
         return 1;
     }
 
-    SOCKET serverSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (serverSocket == INVALID_SOCKET) {
-        std::cerr << "Error creating socket: " << WSAGetLastError() << "\n";
-        WSACleanup();
-        return 2;
-    }
-
-    int yes = 1;
-    if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, (char*)&yes, sizeof(yes)) == SOCKET_ERROR) {
-        std::cerr << "Setsockopt failed: " << WSAGetLastError() << "\n";
-        safeCloseSocket(serverSocket);
-        WSACleanup();
-        return 3;
-    }
-
-    sockaddr_in serverAddr{};
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = INADDR_ANY;
-    serverAddr.sin_port = htons(port);
-
-    if (bind(serverSocket, (SOCKADDR*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR) {
-        std::cerr << "Bind failed on port " << port << ": " << WSAGetLastError() << "\n";
-        std::cerr << "Make sure the port is not already in use\n";
-        safeCloseSocket(serverSocket);
-        WSACleanup();
-        return 4;
-    }
-
-    if (listen(serverSocket, SOMAXCONN) == SOCKET_ERROR) {
-        std::cerr << "Listen failed: " << WSAGetLastError() << "\n";
-        safeCloseSocket(serverSocket);
-        WSACleanup();
-        return 5;
-    }
-
-    std::cout << "Server is listening on port " << port << "\n";
-    std::cout << "Waiting for players to connect...\n";
-
-    // Принятие подключения первого игрока
-    SOCKADDR_IN clientAddr1;
-    int clientAddrSize = sizeof(clientAddr1);
-    SOCKET clientSocket1 = accept(serverSocket, (SOCKADDR*)&clientAddr1, &clientAddrSize);
-    if (clientSocket1 == INVALID_SOCKET) {
-        std::cerr << "Accept failed for player 1: " << WSAGetLastError() << "\n";
-        safeCloseSocket(serverSocket);
-        WSACleanup();
-        return 6;
-    }
-
-    char clientIP1[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &clientAddr1.sin_addr, clientIP1, INET_ADDRSTRLEN);
-    std::cout << "Player 1 connected from " << clientIP1 << ":" << ntohs(clientAddr1.sin_port) << "\n";
-
-    Player player1(clientSocket1);
-    player1.name = "Player 1";
-
-    // Принятие подключения второго игрока
-    SOCKADDR_IN clientAddr2;
-    SOCKET clientSocket2 = accept(serverSocket, (SOCKADDR*)&clientAddr2, &clientAddrSize);
-    if (clientSocket2 == INVALID_SOCKET) {
-        std::cerr << "Accept failed for player 2: " << WSAGetLastError() << "\n";
-        safeCloseSocket(clientSocket1);
-        safeCloseSocket(serverSocket);
-        WSACleanup();
-        return 7;
-    }
-
-    char clientIP2[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &clientAddr2.sin_addr, clientIP2, INET_ADDRSTRLEN);
-    std::cout << "Player 2 connected from " << clientIP2 << ":" << ntohs(clientAddr2.sin_port) << "\n";
-
-    Player player2(clientSocket2);
-    player2.name = "Player 2";
-
-    Game game(&player1, &player2);
-
-    auto setupPhase = [](Player& player) {
-        const std::string welcome = "Welcome to Sea Battle! Placing ships automatically...\n";
-        if (!safeSend(player.socket, welcome)) {
-            player.connected = false;
-            return false;
-        }
-
-        player.autoPlaceShips();
-
-        std::string boardMsg = "Your ships have been placed automatically:\n";
-        boardMsg += player.getBoardString() + "\n";
-        if (!safeSend(player.socket, boardMsg)) {
-            player.connected = false;
-            return false;
-        }
-
-        player.ready = true;
-        const std::string readyMsg = "All ships placed! Waiting for other player...\n";
-        if (!safeSend(player.socket, readyMsg)) {
-            player.connected = false;
-            return false;
-        }
-        return true;
-        };
-
-    std::thread setupThread1(setupPhase, std::ref(player1));
-    std::thread setupThread2(setupPhase, std::ref(player2));
-
-    setupThread1.join();
-    setupThread2.join();
-
-    if (!player1.connected || !player2.connected) {
-        std::cerr << "Player disconnected during setup phase\n";
-        safeCloseSocket(clientSocket1);
-        safeCloseSocket(clientSocket2);
-        safeCloseSocket(serverSocket);
-        WSACleanup();
-        return 8;
-    }
-
-    while (!game.bothReady()) {
-        Sleep(100);
-        if (!game.checkConnections()) {
-            std::cerr << "Player disconnected while waiting for readiness\n";
-            break;
-        }
-    }
-
-    if (game.bothReady()) {
-        const std::string startMsg = "Game started! Player 1 goes first.\n";
-        if (!safeSend(player1.socket, startMsg) || !safeSend(player2.socket, startMsg)) {
-            game.gameOver = true;
-        }
-    }
-
-    std::string inputBuffer;
-
-    while (!game.gameOver && game.checkConnections()) {
-        Player* current = game.currentPlayer;
-        Player* opponent = game.getOpponent();
-
-        std::string currentTurnMsg = "YOUR_TURN\n";
-        currentTurnMsg += "Your board:\n" + current->getBoardString() + "\n";
-        currentTurnMsg += "Enemy view:\n" + current->getEnemyViewString() + "\n";
-        currentTurnMsg += "Enter coordinates to shoot (x y): ";
-
-        std::string otherTurnMsg = "OPPONENT_TURN\n";
-        otherTurnMsg += "Your board:\n" + opponent->getBoardString() + "\n";
-        otherTurnMsg += "Enemy view:\n" + opponent->getEnemyViewString() + "\n";
-        otherTurnMsg += "Waiting for opponent's move...\n";
-
-        if (!safeSend(current->socket, currentTurnMsg) || !safeSend(opponent->socket, otherTurnMsg)) {
-            game.gameOver = true;
-            break;
-        }
-
-        if (!safeRecv(current->socket, inputBuffer)) {
-            std::cout << "Player disconnected\n";
-            current->connected = false;
-            game.gameOver = true;
-            break;
-        }
-
-        int x, y;
-        char extra;
-        if (sscanf_s(inputBuffer.c_str(), "%d %d %c", &x, &y, &extra, 1) == 2) {
-            if (x < 0 || x >= BOARD_SIZE || y < 0 || y >= BOARD_SIZE) {
-                const std::string errorMsg = "Invalid coordinates. Use values between 0 and 9.\n";
-                safeSend(current->socket, errorMsg);
-                continue;
-            }
-
-            std::string result = game.processShot(x, y);
-
-            std::string resultMsg = current->name + " shot at (" + std::to_string(x) + "," + std::to_string(y) + ") - " + result;
-
-            if (!safeSend(current->socket, resultMsg) || !safeSend(opponent->socket, resultMsg)) {
-                game.gameOver = true;
-                break;
-            }
-
-            if (!game.gameOver && result.find("HIT") == std::string::npos && result.find("Already attacked") == std::string::npos) {
-                game.switchTurn();
-            }
-        }
-        else {
-            const std::string errorMsg = "Invalid input format. Use: x y (numbers 0-9)\n";
-            safeSend(current->socket, errorMsg);
-        }
-    }
-
-    if (game.gameOver) {
-        if (game.bothReady()) {
-            std::string winMsg = "Congratulations! You won the game!\n";
-            std::string loseMsg = "Game over! You lost.\n";
-
-            safeSend(game.currentPlayer->socket, winMsg);
-            safeSend(game.getOpponent()->socket, loseMsg);
-        }
-        else {
-            std::string disconnectMsg = "Game ended due to player disconnect.\n";
-            if (player1.connected) safeSend(player1.socket, disconnectMsg);
-            if (player2.connected) safeSend(player2.socket, disconnectMsg);
-        }
-    }
-
-    safeCloseSocket(clientSocket1);
-    safeCloseSocket(clientSocket2);
-    safeCloseSocket(serverSocket);
-    WSACleanup();
+    server.start();
 
     std::cout << "Server shutdown complete\n";
     std::cout << "Press Enter to exit...";

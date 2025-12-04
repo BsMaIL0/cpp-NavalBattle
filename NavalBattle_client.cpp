@@ -1,6 +1,6 @@
 ﻿#define _WINSOCK_DEPRECATED_NO_WARNINGS
 #define NOMINMAX 
-
+    
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <iostream>
@@ -377,7 +377,7 @@ int main() {
         }
 
         std::cout << "\nGame client shutting down...\n";
-        std::cout << "Press Enter to exit...";
+         std::cout << "Press Enter to exit...";
         std::cin.ignore();
 
         return 0;
