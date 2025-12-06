@@ -37,3 +37,10 @@ g++ -o NavalBattle_server.exe NavalBattle_server.cpp -lws2_32 -std=c++11 -O2
 
 # Компиляция клиента
 g++ -o NavalBattle_client.exe NavalBattle_client.cpp -lws2_32 -std=c++11 -O2
+
+## 🚀 Запуск системы
+
+### Запустите сервер:
+```bash
+NavalBattle_server.exe
+Сервер запросит порт (по умолчанию 12345)
